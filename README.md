@@ -17,8 +17,8 @@ A PyTorch implementation of the DOT algorithm for transferring cell type annotat
 ### From source
 
 ```bash
-git clone https://github.com/yourusername/dotr-pytorch.git
-cd dotr-pytorch
+git clone https://github.com/earmingol/DOTpy.git
+cd DOTpy
 pip install -e .
 ```
 
