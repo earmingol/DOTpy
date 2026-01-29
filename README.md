@@ -296,7 +296,9 @@ Key differences:
 If you use DOT in your research, please cite:
 
 ```
-[Original DOT paper citation]
+Rahimi, A., Vale-Silva, L.A., Fälth Savitski, M. et al. 
+DOT: a flexible multi-objective optimization framework for transferring features across single-cell and spatial omics. 
+Nat Commun 15, 4994 (2024). https://doi.org/10.1038/s41467-024-48868-z
 ```
 
 ## License
