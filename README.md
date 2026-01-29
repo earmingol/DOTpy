@@ -39,34 +39,42 @@ pip install -e .
 
 ```python
 import scanpy as sc
-from dotpy import setup_reference, setup_spatial, DOT, plot_spatial_weights
+from dotpy import DOT, setup_reference, setup_spatial, plot_spatial_weights
 
-# Load your data
-ref_adata = sc.read_h5ad('reference_scrna.h5ad')
-spatial_adata = sc.read_h5ad('spatial_data.h5ad')
+# Load data
+ref_adata = sc.read_h5ad('reference.h5ad')
+spatial_adata = sc.read_h5ad('spatial.h5ad')
 
-# Process reference data
+# Process (stays sparse!)
 ref_processed = setup_reference(
     ref_adata,
-    cell_type_key='cell_type',  # Column in ref_adata.obs with cell types
-    subcluster_size=10,
+    cell_type_key='cell_type',
     max_genes=5000,
     verbose=True
 )
 
-# Process spatial data
 spatial_processed = setup_spatial(
     spatial_adata,
-    spatial_key='spatial',  # Key in spatial_adata.obsm with coordinates
-    th_spatial=0.84,
+    spatial_key='spatial',
     verbose=True
 )
 
-# Create DOT object and run deconvolution
-dot = DOT(spatial_processed, ref_processed)
-dot.fit(mode='highres', iterations=100, verbose=True)
+# Run DOT with batching
+dot = DOT(
+    spatial_processed, 
+    ref_processed,
+    batch_size=500  # Adjust for your GPU
+)
 
-# Get cell type weights
+dot.fit(
+    mode='highres',
+    iterations=100,
+    checkpoint_dir='./checkpoints',  # Save checkpoints
+    checkpoint_freq=10,
+    verbose=True
+)
+
+# Get results
 weights = dot.get_weights(normalize=True)
 cell_types = dot.get_cell_types()
 
@@ -77,6 +85,18 @@ plot_spatial_weights(
     cell_types=cell_types
 )
 ```
+
+### Resume from Checkpoint
+
+```python
+dot.fit(
+    mode='highres',
+    iterations=100,
+    resume_from='./checkpoints/checkpoint_iter_50.pkl',
+    verbose=True
+)
+```
+
 
 ### High-Resolution Data (Xenium, MERFISH, CosMx)
 
@@ -311,11 +331,19 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Troubleshooting
 
-### CUDA Out of Memory
-
+### "CUDA out of memory"
 ```python
-# Reduce batch size or number of genes
-ref_processed = setup_reference(ref_adata, max_genes=2000)
+# Solution 1: Reduce batch size
+dot = DOT(spatial, ref, batch_size=100)
+
+# Solution 2: Use CPU
+ref = setup_reference(adata, device='cpu')
+```
+
+### "Too slow on CPU"
+```python
+# Solution: Reduce data size
+ref = setup_reference(adata, max_genes=2000, subcluster_size=5)
 ```
 
 ### No common genes found
@@ -328,17 +356,11 @@ print(f"Spatial genes: {spatial_adata.var_names[:10]}")
 # Ensure gene names match (e.g., both use same gene ID system)
 ```
 
-### Slow convergence
-
+### "Convergence issues"
 ```python
-# Try adjusting parameters
-dot.fit(
-    mode='highres',
-    iterations=150,
-    gap_threshold=0.01  # Looser convergence
-)
+# Solution: More iterations or looser threshold
+dot.fit(iterations=200, gap_threshold=0.05)
 ```
-
 ## Contact
 
 For questions and issues, please open an issue on GitHub.
