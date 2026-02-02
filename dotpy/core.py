@@ -1,16 +1,3 @@
-"""
-OPTIMIZED core DOT algorithm with minimal GPU I/O
-
-Key optimizations:
-1. Reference data moved to GPU ONCE at start
-2. Solution (Yt) kept on GPU throughout optimization
-3. Batching only for spatial data (not reference)
-4. Gene-wise operations also batched
-5. Minimal CPU-GPU transfers - only for checkpointing
-
-Performance improvement: ~5-10x faster on GPU
-"""
-
 import numpy as np
 import torch
 import torch.nn.functional as F
