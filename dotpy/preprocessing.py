@@ -135,7 +135,7 @@ def setup_reference(
     # ==================================================================
     if verbose:
         print("Running basic QC...")
-    sc.pp.calculate_qc_metrics(adata, inplace=True)
+    # sc.pp.calculate_qc_metrics(adata, inplace=True)
     sc.pp.filter_cells(adata, min_counts=1)
     sc.pp.filter_genes(adata, min_cells=1)
 
@@ -368,6 +368,7 @@ def _make_pca_safe_layer(adata, eps=1e-6):
 
     zero_var = var == 0
     if not np.any(zero_var):
+        adata.layers["pca_safe"] = X.copy()
         return
 
     X_safe = X.copy()
