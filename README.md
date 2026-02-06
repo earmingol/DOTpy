@@ -6,7 +6,7 @@ A PyTorch implementation of the DOT algorithm for transferring cell type annotat
 
 ## Features
 
-- 🚀 **GPU acceleration** using PyTorch for fast computation
+- 🚀 **GPU acceleration** using PyTorch and RAPIDS-singlecell for fast computation
 - 🧬 **AnnData integration** - seamlessly works with scanpy workflows
 - 🎯 **Multi-objective optimization** using Frank-Wolfe algorithm
 - 📊 **High & low resolution support** - works with both subcellular (Xenium, MERFISH, CosMx) and spot-based (Visium, ST) technologies
@@ -321,14 +321,6 @@ DOT: a flexible multi-objective optimization framework for transferring features
 Nat Commun 15, 4994 (2024). https://doi.org/10.1038/s41467-024-48868-z
 ```
 
-## License
-
-MIT License
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
 ## Troubleshooting
 
 ### "CUDA out of memory"
@@ -361,9 +353,21 @@ print(f"Spatial genes: {spatial_adata.var_names[:10]}")
 # Solution: More iterations or looser threshold
 dot.fit(iterations=200, gap_threshold=0.05)
 ```
+
 ## Contact
 
 For questions and issues, please open an issue on GitHub.
 
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+
 ## Disclaimer
 This library was written in Python using Claude Sonnet 4.5 and GPT-5.2 models.
+
+
+## License
+
+MIT License
