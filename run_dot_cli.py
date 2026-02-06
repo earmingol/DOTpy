@@ -129,7 +129,7 @@ def main():
     print(f"\nDevice:           {device}")
     if device == 'cuda' and torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
-        print(f"  GPU:            {props.name}  ({props.total_mem / 1e9:.1f} GB)")
+        print(f"  GPU:            {props.name}  ({props.total_memory / 1e9:.1f} GB)")
     print(f"Mixed precision:  {'ON' if args.mixed_precision else 'OFF'}")
     print(f"\nOutput directory: {output_dir}")
     print(f"Figures directory: {figures_dir}")
