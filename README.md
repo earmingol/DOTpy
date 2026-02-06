@@ -364,3 +364,6 @@ dot.fit(iterations=200, gap_threshold=0.05)
 ## Contact
 
 For questions and issues, please open an issue on GitHub.
+
+## Disclaimer
+This library was written in Python using Claude Sonnet 4.5 and GPT-5.2 models.

@@ -1,6 +1,4 @@
-"""
-Setup script for DOTpy
-"""
+"""Setup script for DOTpy"""
 
 from setuptools import setup, find_packages
 
@@ -9,7 +7,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="DOTpy",
-    version="0.1.0",
+    version="0.2.0",
     author="Erick Armingol",
     author_email="erickarmingol@gmail.com",
     description="PyTorch implementation of DOT for spatial transcriptomics deconvolution",
@@ -22,6 +20,7 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Intended Audience :: Science/Research",
@@ -38,6 +37,10 @@ setup(
         "scipy>=1.7.0",
     ],
     extras_require={
+        "gpu": [
+            "rapids-singlecell>=0.10.0",
+            "cupy",
+        ],
         "dev": [
             "pytest>=7.0.0",
             "pytest-cov>=3.0.0",

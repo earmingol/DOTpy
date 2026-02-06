@@ -5,3 +5,7 @@ anndata>=0.8.0
 matplotlib>=3.5.0
 scikit-learn>=1.0.0
 scipy>=1.7.0
+
+# Optional GPU-accelerated preprocessing (uncomment if using NVIDIA GPU + RAPIDS):
+# rapids-singlecell>=0.10.0
+# cupy
