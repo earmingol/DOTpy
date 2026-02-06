@@ -1,16 +1,24 @@
 """Setup script for DOTpy"""
 
+import ast
+import re
 from setuptools import setup, find_packages
+
+_version_re = re.compile(r'__version__\s+=\s+(.*)')
+
+with open('dotpy/__init__.py', 'rb') as f:
+    hit = _version_re.search(f.read().decode('utf-8')).group(1)
+    version = str(ast.literal_eval(hit))
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
     name="DOTpy",
-    version="0.2.0",
+    version=version,
     author="Erick Armingol",
     author_email="erickarmingol@gmail.com",
-    description="PyTorch implementation of DOT for spatial transcriptomics deconvolution",
+    description="Python implementation of DOT for spatial transcriptomics deconvolution",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/earmingol/DOTpy",
