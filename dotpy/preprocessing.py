@@ -149,7 +149,6 @@ def _aggregate_reference(
     major_types = np.unique(annotations)
     n_genes = X.shape[1]
 
-    # Stage 1: Compute major centroids with sampling (max 1000 per type)
     if verbose:
         print("Computing major centroids...")
 
@@ -187,7 +186,6 @@ def _aggregate_reference(
 
     major_centroids = np.array(major_centroids_list)
 
-    # Stage 2: Sub-clustering
     if cluster_size <= 1:
         if issparse(X):
             sub_centroids = vstack([csr_matrix(c) for c in major_centroids_list])
@@ -439,10 +437,10 @@ def setup_spatial(
     adata: AnnData,
     spatial_key: str = 'spatial',
     th_spatial: float = 0.84,
-    th_nonspatial: float = 0.0,
-    max_pairs: int = 100000,
+    th_gene_low: float = 0.01,
+    th_gene_high: float = 0.99,
+    remove_mt: bool = True,
     radius: str = 'auto',
-    n_neighbors: int = 8,
     verbose: bool = False,
     copy: bool = True
 ) -> Dict:
@@ -459,12 +457,14 @@ def setup_spatial(
         Cosine similarity threshold for spatial pairs
     th_nonspatial : float
         Threshold for non-spatial pairs (0 to disable)
-    max_pairs : int
-        Maximum number of pairs to return
+    th_gene_low : float
+        Minimum fraction of spots a gene must be expressed in
+    th_gene_high : float
+        Maximum fraction of spots a gene can be expressed in
+    remove_mt : bool
+        Remove MT/RPL genes
     radius : str or float
         Spatial radius ('auto' or numeric value)
-    n_neighbors : int
-        Number of neighbors for radius estimation
     verbose : bool
         Print progress
     copy : bool
@@ -473,7 +473,7 @@ def setup_spatial(
     Returns
     -------
     dict
-        'X_sparse', 'coords', 'genes', 'pairs'
+        'X_sparse', 'coords', 'genes', 'pairs' (if th_spatial > 0)
     """
     if copy:
         adata = adata.copy()
@@ -484,11 +484,28 @@ def setup_spatial(
     if coords.shape[1] > 2:
         coords = coords[:, :2]
 
+    if verbose:
+        print(f"Processing spatial data: {adata.shape}")
+
+    # Remove MT genes
+    if remove_mt:
+        mt_mask = adata.var_names.str.match('^MT-|^mt-|^RPL')
+        n_mt = mt_mask.sum()
+        if n_mt > 0:
+            adata = adata[:, ~mt_mask].copy()
+            if verbose:
+                print(f"Removed {n_mt} MT/RPL genes")
+
+    # Gene frequency filter
+    if th_gene_high < 1 or th_gene_low > 0:
+        gene_freq = np.asarray((adata.X > 0).mean(axis=0)).flatten()
+        valid = (gene_freq > th_gene_low) & (gene_freq < th_gene_high)
+        adata = adata[:, valid].copy()
+        if verbose:
+            print(f"Filtered to {adata.shape[1]} genes")
+
     X = adata.X
     genes = adata.var_names.values
-
-    if verbose:
-        print(f"Processing spatial data: {X.shape}")
 
     result = {
         'X_sparse': X,
@@ -496,6 +513,7 @@ def setup_spatial(
         'genes': genes
     }
 
+    # Spatial pairs
     if th_spatial > 0:
         if issparse(X):
             X_norm = sk_normalize(X, norm='l2', axis=1, copy=True)
@@ -507,11 +525,81 @@ def setup_spatial(
         if verbose:
             print("Finding spatial neighbours...")
 
-        pairs_dict = _get_spatial_pairs(
-            X_norm, coords, th_spatial, th_nonspatial,
-            radius, n_neighbors, max_pairs, verbose
-        )
-        result['pairs'] = pairs_dict
+        N = coords.shape[0]
+        n_neighbors = 8
+
+        if radius == 'auto':
+            nbrs_est = NearestNeighbors(
+                n_neighbors=min(n_neighbors + 1, N),
+                algorithm='ball_tree',
+                metric='euclidean'
+            )
+            nbrs_est.fit(coords)
+            dists, _ = nbrs_est.kneighbors(coords)
+            radius = float(np.quantile(dists[:, -1], 0.9) * 1.05)
+            if verbose:
+                print(f"Estimated spatial radius: {radius:.2f}")
+
+        if verbose:
+            print(f"Finding spatial neighbors (radius={radius:.2f})...")
+
+        nbrs = NearestNeighbors(radius=radius, algorithm='ball_tree', metric='euclidean')
+        nbrs.fit(coords)
+        distances_list, indices_list = nbrs.radius_neighbors(coords)
+
+        all_i = []
+        all_j = []
+        for i in range(N):
+            nbr = indices_list[i]
+            mask = nbr > i
+            js = nbr[mask]
+            if len(js) > 0:
+                all_i.append(np.full(len(js), i, dtype=np.int64))
+                all_j.append(js.astype(np.int64))
+
+        if len(all_i) > 0:
+            i_idx = np.concatenate(all_i)
+            j_idx = np.concatenate(all_j)
+
+            # Compute cosine similarities
+            PAIR_BATCH = 500_000
+            n_pairs = len(i_idx)
+            weights = np.empty(n_pairs, dtype=np.float64)
+
+            for start in range(0, n_pairs, PAIR_BATCH):
+                end = min(start + PAIR_BATCH, n_pairs)
+                bi = i_idx[start:end]
+                bj = j_idx[start:end]
+
+                if issparse(X_norm):
+                    Xi = X_norm[bi]
+                    Xj = X_norm[bj]
+                    sims = np.asarray(Xi.multiply(Xj).sum(axis=1)).flatten()
+                else:
+                    sims = np.einsum('ij,ij->i', X_norm[bi], X_norm[bj])
+
+                weights[start:end] = sims
+
+            # Filter by threshold
+            valid = weights >= th_spatial
+            i_idx = i_idx[valid]
+            j_idx = j_idx[valid]
+            weights = weights[valid]
+
+            if len(i_idx) > 0:
+                if verbose:
+                    print(f"Found {len(i_idx)} spatial pairs")
+
+                # Return as dict
+                result['pairs'] = {
+                    'i': i_idx,
+                    'j': j_idx,
+                    'w': weights
+                }
+            elif verbose:
+                print("No spatial pairs found")
+        elif verbose:
+            print("No spatial pairs found")
 
     if verbose:
         print(f"Spatial data prepared: {X.shape[0]} spots, {X.shape[1]} genes")
@@ -519,85 +607,3 @@ def setup_spatial(
             print(f"Sparsity: {1 - X.nnz / (X.shape[0] * X.shape[1]):.2%}")
 
     return result
-
-
-def _get_spatial_pairs(
-    X_norm, coords, th_spatial, th_nonspatial,
-    radius, n_neighbors, max_pairs, verbose
-):
-    """Find spatial pairs using radius search."""
-    N = coords.shape[0]
-
-    if radius == 'auto':
-        nbrs_est = NearestNeighbors(
-            n_neighbors=min(n_neighbors + 1, N),
-            algorithm='ball_tree',
-            metric='euclidean'
-        )
-        nbrs_est.fit(coords)
-        dists, _ = nbrs_est.kneighbors(coords)
-        radius = float(np.quantile(dists[:, -1], 0.9) * 1.05)
-        if verbose:
-            print(f"Estimated spatial radius: {radius:.2f}")
-
-    if verbose:
-        print(f"Finding spatial neighbors (radius={radius:.2f})...")
-
-    nbrs = NearestNeighbors(radius=radius, algorithm='ball_tree', metric='euclidean')
-    nbrs.fit(coords)
-    distances_list, indices_list = nbrs.radius_neighbors(coords)
-
-    all_i = []
-    all_j = []
-    for i in range(N):
-        nbr = indices_list[i]
-        mask = nbr > i
-        js = nbr[mask]
-        if len(js) > 0:
-            all_i.append(np.full(len(js), i, dtype=np.int64))
-            all_j.append(js.astype(np.int64))
-
-    if len(all_i) == 0:
-        if verbose:
-            print("No spatial pairs found")
-        return None
-
-    i_idx = np.concatenate(all_i)
-    j_idx = np.concatenate(all_j)
-
-    PAIR_BATCH = 500_000
-    n_pairs = len(i_idx)
-    weights = np.empty(n_pairs, dtype=np.float64)
-
-    for start in range(0, n_pairs, PAIR_BATCH):
-        end = min(start + PAIR_BATCH, n_pairs)
-        bi = i_idx[start:end]
-        bj = j_idx[start:end]
-
-        if issparse(X_norm):
-            Xi = X_norm[bi]
-            Xj = X_norm[bj]
-            sims = np.asarray(Xi.multiply(Xj).sum(axis=1)).flatten()
-        else:
-            sims = np.einsum('ij,ij->i', X_norm[bi], X_norm[bj])
-
-        weights[start:end] = sims
-
-    valid = weights >= th_spatial
-    i_idx = i_idx[valid]
-    j_idx = j_idx[valid]
-    weights = weights[valid]
-
-    if len(i_idx) > max_pairs:
-        top_idx = np.argsort(weights)[::-1][:max_pairs]
-        i_idx = i_idx[top_idx]
-        j_idx = j_idx[top_idx]
-        weights = weights[top_idx]
-
-    if verbose:
-        print(f"Found {len(i_idx)} spatial pairs")
-
-    if len(i_idx) == 0:
-        return None
-
-    return {'i': i_idx, 'j': j_idx, 'w': weights}
