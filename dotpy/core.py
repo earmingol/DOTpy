@@ -18,6 +18,7 @@ class DOT:
         ref: Dict,
         ls_solution: bool = True,
         batch_size: int = 500,
+        device: Optional[str] = None,
     ):
         # --- Gene alignment ---
         common_genes = np.intersect1d(spatial['genes'], ref['genes'])
@@ -36,7 +37,7 @@ class DOT:
             'X_sparse': X_sp,
             'coords': spatial['coords'],
             'genes': spatial['genes'][sp_idx],
-            'device': spatial['device'],
+            'device': device or 'cpu',
         }
         if 'pairs' in spatial:
             self.spatial['pairs'] = spatial['pairs']
@@ -46,7 +47,7 @@ class DOT:
             'clusters': ref['clusters'],
             'ratios': ref['ratios'],
             'genes': ref['genes'][rf_idx],
-            'device': ref['device'],
+            'device': device or 'cpu',
         }
 
         self.batch_size = batch_size

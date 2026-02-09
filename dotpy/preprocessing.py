@@ -1,76 +1,304 @@
 """
-Preprocessing utilities for DOT algorithm
+Preprocessing utilities for DOT algorithm - R-compatible version
 
-Memory-efficient implementation with optional GPU acceleration via rapids-singlecell.
-Automatically selects scanpy (CPU) or rapids-singlecell (GPU) based on device parameter.
+Memory-efficient implementation with sparse matrix support.
 """
 
 import numpy as np
-import torch
-import scanpy as sc
-from typing import Optional, Union, Tuple, Dict, List
+from typing import Optional, Dict
 from anndata import AnnData
 from scipy.sparse import issparse, csr_matrix, vstack
-import warnings
-
-# ---------------------------------------------------------------------------
-# Backend helpers – transparently choose scanpy vs rapids_singlecell
-# ---------------------------------------------------------------------------
-
-_RSC_AVAILABLE: Optional[bool] = None
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.preprocessing import normalize as sk_normalize
+from sklearn.neighbors import NearestNeighbors
+import scanpy as sc
 
 
-def _check_rapids():
-    """Lazy-check whether rapids-singlecell is importable."""
-    global _RSC_AVAILABLE
-    if _RSC_AVAILABLE is None:
-        try:
-            import rapids_singlecell  # noqa: F401
-            import cupy  # noqa: F401
-            _RSC_AVAILABLE = True
-        except ImportError:
-            _RSC_AVAILABLE = False
-    return _RSC_AVAILABLE
+def _select_kmeans_genes(
+    ct_centroid: np.ndarray,
+    major_centroids: np.ndarray,
+    major_ratios: Dict[str, float],
+    ct_name: str,
+    th_logfold: float = 0.75,
+    max_genes: int = 500
+) -> np.ndarray:
+    """Select genes for k-means clustering based on log-fold change."""
+    all_types = list(major_ratios.keys())
+    ct_idx = all_types.index(ct_name)
+    other_types = [t for i, t in enumerate(all_types) if i != ct_idx]
+
+    if len(other_types) == 0:
+        return np.arange(len(ct_centroid))
+
+    other_ratios_norm = np.array([major_ratios[t] for t in other_types])
+    other_ratios_norm = other_ratios_norm / other_ratios_norm.sum()
+
+    other_indices = [i for i, t in enumerate(all_types) if t in other_types]
+    other_centroids = major_centroids[other_indices, :]
+
+    other_avg = other_ratios_norm @ other_centroids
+    logfc = np.log((ct_centroid + 1e-9) / (other_avg + 1e-9))
+
+    passing = np.where(logfc > th_logfold)[0]
+
+    if len(passing) == 0:
+        return np.arange(len(ct_centroid))
+
+    if len(passing) > max_genes:
+        passing = passing[np.argsort(logfc[passing])[::-1][:max_genes]]
+
+    return passing
 
 
-def _get_pp(device: str):
-    """Return the preprocessing module (scanpy.pp or rapids_singlecell.pp)."""
-    if device == 'cuda' and _check_rapids():
-        import rapids_singlecell as rsc
-        return rsc.pp
-    return sc.pp
+def _kmeans_subcluster(
+    X_ct: np.ndarray,
+    gene_indices: np.ndarray,
+    K: int,
+    min_frac: float = 0.025,
+    random_state: int = 42
+) -> np.ndarray:
+    """K-means clustering with small cluster filtering."""
+    if issparse(X_ct):
+        X_subset = X_ct[:, gene_indices].toarray()
+    else:
+        X_subset = X_ct[:, gene_indices]
+
+    if X_subset.shape[0] > 10000:
+        km = MiniBatchKMeans(
+            n_clusters=K,
+            n_init=10,
+            random_state=random_state,
+            batch_size=1000,
+            max_iter=300
+        )
+    else:
+        km = KMeans(
+            n_clusters=K,
+            n_init=10,
+            random_state=random_state,
+            max_iter=300
+        )
+
+    labels = km.fit_predict(X_subset)
+
+    n_cells = len(labels)
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    noise_mask = counts < (min_frac * n_cells)
+    noise_clusters = unique_labels[noise_mask]
+
+    if len(noise_clusters) > 0:
+        labels = labels.copy()
+        for nc in noise_clusters:
+            labels[labels == nc] = -1
+
+    return labels
 
 
-def _get_tl(device: str):
-    """Return the tools module (scanpy.tl or rapids_singlecell.tl)."""
-    if device == 'cuda' and _check_rapids():
-        import rapids_singlecell as rsc
-        return rsc.tl
-    return sc.tl
+def _get_de_genes_r_style(
+    centroids: np.ndarray,
+    max_genes: int,
+    verbose: bool = False
+) -> np.ndarray:
+    """Select DE genes using R's median rank scoring method."""
+    if centroids.shape[1] <= max_genes:
+        return np.arange(centroids.shape[1])
+
+    C, G = centroids.shape
+
+    if issparse(centroids):
+        centroids_dense = centroids.toarray() + 1e-9
+    else:
+        centroids_dense = centroids.copy() + 1e-9
+
+    gene_scores = np.zeros((C, G), dtype=np.float32)
+
+    if verbose:
+        print(f"Computing gene scores for {C} clusters, {G} genes...")
+
+    for i in range(C):
+        this_ct = np.tile(centroids_dense[i:i+1, :], (C-1, 1))
+        other_ct = np.delete(centroids_dense, i, axis=0)
+        logfc = np.log(this_ct / other_ct)
+
+        ranks = np.empty_like(logfc)
+        for j in range(C-1):
+            ranks[j, :] = G - np.argsort(np.argsort(logfc[j, :]))
+
+        gene_scores[i, :] = np.median(ranks, axis=0)
+
+    min_scores = gene_scores.min(axis=0)
+    top_genes = np.argsort(min_scores)[:max_genes]
+
+    if verbose:
+        print(f"Selected {len(top_genes)} DE genes using R-style ranking")
+
+    return top_genes
 
 
-def _to_gpu_anndata(adata: AnnData):
-    """Move AnnData.X to GPU (cupy sparse) if rapids is available."""
-    if _check_rapids():
-        import rapids_singlecell as rsc
-        rsc.get.anndata_to_GPU(adata)
-    return adata
+def _aggregate_reference(
+    X: np.ndarray,
+    annotations: np.ndarray,
+    cluster_size: int,
+    th_inner_logfold: float = 0.75,
+    random_state: int = 42,
+    verbose: bool = False
+) -> Dict:
+    """Aggregate reference data with R-compatible algorithm."""
+    np.random.seed(random_state)
 
+    major_types = np.unique(annotations)
+    n_genes = X.shape[1]
 
-def _to_cpu_anndata(adata: AnnData):
-    """Ensure AnnData.X is on CPU (scipy sparse / numpy)."""
-    if _check_rapids():
-        try:
-            import rapids_singlecell as rsc
-            rsc.get.anndata_to_CPU(adata)
-        except Exception:
-            pass
-    return adata
+    # Stage 1: Compute major centroids with sampling (max 1000 per type)
+    if verbose:
+        print("Computing major centroids...")
 
+    candidate_indices = []
+    candidate_types = []
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+    for ct in major_types:
+        ct_idx = np.where(annotations == ct)[0]
+
+        if len(ct_idx) > 1000:
+            ct_idx = np.random.choice(ct_idx, 1000, replace=False)
+
+        candidate_indices.extend(ct_idx)
+        candidate_types.extend([ct] * len(ct_idx))
+
+    candidate_indices = np.array(candidate_indices)
+    candidate_types = np.array(candidate_types)
+
+    major_centroids_list = []
+    major_ratios = {}
+
+    for ct in major_types:
+        ct_mask = candidate_types == ct
+
+        if issparse(X):
+            centroid = np.asarray(X[candidate_indices[ct_mask]].mean(axis=0)).flatten()
+        else:
+            centroid = X[candidate_indices[ct_mask]].mean(axis=0)
+
+        major_centroids_list.append(centroid)
+        major_ratios[ct] = int((annotations == ct).sum())
+
+    total = sum(major_ratios.values())
+    major_ratios = {k: v / total for k, v in major_ratios.items()}
+
+    major_centroids = np.array(major_centroids_list)
+
+    # Stage 2: Sub-clustering
+    if cluster_size <= 1:
+        if issparse(X):
+            sub_centroids = vstack([csr_matrix(c) for c in major_centroids_list])
+        else:
+            sub_centroids = major_centroids
+
+        clusters = {ct: [i] for i, ct in enumerate(major_types)}
+
+        return {
+            'major_centroids': major_centroids,
+            'major_ratios': major_ratios,
+            'sub_centroids': sub_centroids,
+            'clusters': clusters
+        }
+
+    if verbose:
+        print(f"Sub-clustering {len(major_types)} cell types...")
+
+    sub_centroids_list = []
+    clusters = {}
+
+    for ct_idx, ct in enumerate(major_types):
+        ct_mask = annotations == ct
+        ct_indices = np.where(ct_mask)[0]
+
+        if len(ct_indices) <= 1:
+            continue
+
+        if len(ct_indices) > 10000:
+            ct_indices = np.random.choice(ct_indices, 10000, replace=False)
+
+        X_ct = X[ct_indices]
+
+        K = min(cluster_size, max(1, int(np.round(2 * np.log(len(ct_indices)) - 7))))
+
+        if K <= 1:
+            if issparse(X_ct):
+                centroid = np.asarray(X_ct.mean(axis=0)).flatten()
+            else:
+                centroid = X_ct.mean(axis=0)
+            sub_centroids_list.append(centroid)
+            clusters[ct] = [len(sub_centroids_list) - 1]
+            continue
+
+        kmeans_genes = np.arange(n_genes)
+
+        if n_genes > 500:
+            kmeans_genes = _select_kmeans_genes(
+                ct_centroid=major_centroids[ct_idx],
+                major_centroids=major_centroids,
+                major_ratios=major_ratios,
+                ct_name=ct,
+                th_logfold=th_inner_logfold,
+                max_genes=500
+            )
+
+        if verbose:
+            print(f"  Clustering {len(ct_indices)} {ct} cells into ~{K} clusters "
+                  f"(using {len(kmeans_genes)} genes)...")
+
+        labels = _kmeans_subcluster(
+            X_ct=X_ct,
+            gene_indices=kmeans_genes,
+            K=K,
+            min_frac=0.025,
+            random_state=random_state
+        )
+
+        valid_mask = labels >= 0
+
+        if valid_mask.sum() == 0:
+            if issparse(X_ct):
+                centroid = np.asarray(X_ct.mean(axis=0)).flatten()
+            else:
+                centroid = X_ct.mean(axis=0)
+            sub_centroids_list.append(centroid)
+            clusters[ct] = [len(sub_centroids_list) - 1]
+            continue
+
+        X_ct_valid = X_ct[valid_mask]
+        labels_valid = labels[valid_mask]
+
+        cluster_ids = []
+        for sc_label in np.unique(labels_valid):
+            sc_mask = labels_valid == sc_label
+
+            if issparse(X_ct_valid):
+                sc_centroid = np.asarray(X_ct_valid[sc_mask].mean(axis=0)).flatten()
+            else:
+                sc_centroid = X_ct_valid[sc_mask].mean(axis=0)
+
+            sub_centroids_list.append(sc_centroid)
+            cluster_ids.append(len(sub_centroids_list) - 1)
+
+        clusters[ct] = cluster_ids
+
+    if issparse(X):
+        sub_centroids = vstack([csr_matrix(c) for c in sub_centroids_list])
+    else:
+        sub_centroids = np.array(sub_centroids_list)
+
+    if verbose:
+        print(f"Created {len(sub_centroids_list)} sub-clusters from {len(major_types)} cell types")
+
+    return {
+        'major_centroids': major_centroids,
+        'major_ratios': major_ratios,
+        'sub_centroids': sub_centroids,
+        'clusters': clusters
+    }
+
 
 def setup_reference(
     adata: AnnData,
@@ -78,17 +306,13 @@ def setup_reference(
     subcluster_size: int = 10,
     max_genes: int = 5000,
     remove_mt: bool = True,
+    th_inner_logfold: float = 0.75,
+    random_state: int = 42,
     verbose: bool = False,
-    device: Optional[str] = None,
     copy: bool = True
 ) -> Dict:
     """
-    Process reference single-cell RNA-seq data for DOT.
-
-    When ``device='cuda'`` and *rapids-singlecell* is installed the heavy
-    lifting (normalisation, HVG selection, neighbour computation, Leiden
-    clustering) runs on the GPU via cuML / cupy.  Otherwise scanpy is used
-    transparently.
+    Process reference single-cell RNA-seq data for DOT (R-compatible version).
 
     Parameters
     ----------
@@ -101,138 +325,112 @@ def setup_reference(
     max_genes : int
         Maximum number of genes to use
     remove_mt : bool
-        Whether to remove mitochondrial / ribosomal / HLA genes
+        Whether to remove mitochondrial / ribosomal genes
+    th_inner_logfold : float
+        Log-fold threshold for gene selection in sub-clustering
+    random_state : int
+        Random seed for reproducibility
     verbose : bool
         Print progress messages
-    device : str, optional
-        ``'cuda'`` to attempt GPU preprocessing, ``'cpu'`` otherwise.
     copy : bool
         Whether to copy adata before processing
 
     Returns
     -------
     dict
-        ``X_sparse``, ``clusters``, ``ratios``, ``genes``, ``device``
+        'X_sparse', 'clusters', 'ratios', 'genes'
     """
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    use_gpu_pp = device == 'cuda' and _check_rapids()
-    pp = _get_pp(device)
-    tl = _get_tl(device)
-
     if verbose:
-        backend = "rapids-singlecell (GPU)" if use_gpu_pp else "scanpy (CPU)"
-        print(f"Preprocessing reference data with {backend}...")
+        print("=" * 60)
+        print("DOT Reference Preprocessing (R-compatible)")
+        print("=" * 60)
         print(f"Input shape: {adata.shape}")
 
     if copy:
         adata = adata.copy()
 
-    # ==================================================================
-    # Phase 1 – CPU-only operations (scanpy QC, gene filtering, counts)
-    # Keep everything on CPU here; scanpy QC cannot handle cupy arrays.
-    # ==================================================================
     if verbose:
-        print("Running basic QC...")
-    # sc.pp.calculate_qc_metrics(adata, inplace=True)
+        print("\nRunning basic QC...")
     sc.pp.filter_cells(adata, min_counts=1)
     sc.pp.filter_genes(adata, min_cells=1)
 
-    # Remove MT / HLA / RPL genes
     if remove_mt:
-        mt_mask = adata.var_names.str.match('^MT-|^mt-|^RPL') # |^HLA-
+        mt_mask = adata.var_names.str.match('^MT-|^mt-|^RPL')
         n_mt = mt_mask.sum()
         if n_mt > 0:
             adata = adata[:, ~mt_mask].copy()
             if verbose:
-                print(f"Removed {n_mt} MT/RPL genes") # HLA/
+                print(f"Removed {n_mt} MT/RPL genes")
 
-    # Store raw counts layer (always CPU – needed later for aggregation)
-    adata.layers['counts'] = adata.X.copy()
+    X = adata.X
+    annotations = adata.obs[cell_type_key].values.astype(str)
+    genes = adata.var_names.values
 
-    # ==================================================================
-    # Phase 2 – Normalisation & HVG (GPU-accelerated when available)
-    # We snapshot the CPU counts *before* any GPU transfer because
-    # anndata_to_GPU may convert layers to cupy as well.
-    # ==================================================================
-    counts_cpu = adata.X.copy()          # guaranteed scipy/numpy at this point
-    all_gene_names = adata.var_names.tolist()
-
-    if use_gpu_pp:
-        _to_gpu_anndata(adata)
-
-    if verbose:
-        print("Normalising for HVG selection...")
-    pp.normalize_total(adata, target_sum=1e4)
-    pp.log1p(adata)
-
-    # HVG selection – seurat_v3 needs CPU counts layer
     if adata.shape[1] > max_genes:
         if verbose:
-            print(f"Selecting {max_genes} highly variable genes...")
-        if use_gpu_pp:
-            _to_cpu_anndata(adata)
-        # Restore the original CPU counts for HVG ranking
-        adata.layers['counts'] = counts_cpu
+            print(f"\nSelecting {max_genes} highly variable genes...")
+
+        adata_hvg = adata.copy()
+        sc.pp.normalize_total(adata_hvg, target_sum=1e4)
+        sc.pp.log1p(adata_hvg)
+        adata_hvg.layers['counts'] = adata.X.copy()
+
         sc.pp.highly_variable_genes(
-            adata,
+            adata_hvg,
             n_top_genes=max_genes,
             flavor='seurat_v3',
             layer='counts',
             subset=False
         )
-        hvg_genes = adata.var_names[adata.var['highly_variable']].tolist()
+
+        hvg_genes = adata_hvg.var_names[adata_hvg.var['highly_variable']].tolist()
         adata = adata[:, hvg_genes].copy()
-
-    # --- Aggregation (always on CPU – small matrices) ---
-    if use_gpu_pp:
-        _to_cpu_anndata(adata)
-
-    # Re-subset the CPU counts to match current (possibly HVG-filtered) genes
-    current_genes = adata.var_names.tolist()
-    if len(current_genes) != len(all_gene_names):
-        gene_idx = np.array([all_gene_names.index(g) for g in current_genes])
-        counts_cpu = counts_cpu[:, gene_idx]
-    adata.layers['counts'] = counts_cpu
-
-    X = adata.layers['counts']
-    annotations = adata.obs[cell_type_key].values.astype(str)
-    genes = adata.var_names.values
+        X = adata.X
+        genes = adata.var_names.values
 
     if verbose:
-        print(f"After filtering: {X.shape}")
-        print("Aggregating and subclustering cell types...")
+        print(f"\nAfter filtering: {X.shape}")
+        print("\nAggregating and sub-clustering cell types...")
 
     ref_agg = _aggregate_reference(
-        X, annotations, adata, subcluster_size,
-        device=device, verbose=verbose
-    )
-
-    # --- DE gene selection ---
-    if verbose:
-        print("Selecting differentially expressed genes...")
-    de_genes = _get_de_genes(
-        ref_agg['sub_centroids'], ref_agg['clusters'], max_genes,
+        X=X,
+        annotations=annotations,
+        cluster_size=subcluster_size,
+        th_inner_logfold=th_inner_logfold,
+        random_state=random_state,
         verbose=verbose
     )
 
-    X_subset = ref_agg['sub_centroids'][:, de_genes] if issparse(ref_agg['sub_centroids']) \
-        else ref_agg['sub_centroids'][:, de_genes]
+    if verbose:
+        print("\nSelecting differentially expressed genes (R-style)...")
+
+    de_genes = _get_de_genes_r_style(
+        centroids=ref_agg['sub_centroids'],
+        max_genes=max_genes,
+        verbose=verbose
+    )
+
+    if issparse(ref_agg['sub_centroids']):
+        X_subset = ref_agg['sub_centroids'][:, de_genes]
+    else:
+        X_subset = ref_agg['sub_centroids'][:, de_genes]
 
     result = {
         'X_sparse': X_subset,
         'clusters': ref_agg['clusters'],
         'ratios': ref_agg['major_ratios'],
-        'genes': genes[de_genes],
-        'device': device
+        'genes': genes[de_genes]
     }
 
     if verbose:
-        print(f"Reference prepared: {X_subset.shape[0]} subclusters, "
-              f"{X_subset.shape[1]} genes")
+        print(f"\n{'=' * 60}")
+        print(f"Reference prepared:")
+        print(f"  - {X_subset.shape[0]} sub-clusters")
+        print(f"  - {X_subset.shape[1]} genes")
         if issparse(X_subset):
-            print(f"Sparsity: {1 - X_subset.nnz / (X_subset.shape[0] * X_subset.shape[1]):.2%}")
+            sparsity = 1 - X_subset.nnz / (X_subset.shape[0] * X_subset.shape[1])
+            print(f"  - Sparsity: {sparsity:.2%}")
+        print(f"{'=' * 60}")
 
     return result
 
@@ -242,109 +440,78 @@ def setup_spatial(
     spatial_key: str = 'spatial',
     th_spatial: float = 0.84,
     th_nonspatial: float = 0.0,
-    th_gene_low: float = 0.01,
-    th_gene_high: float = 0.99,
-    remove_mt: bool = True,
+    max_pairs: int = 100000,
+    radius: str = 'auto',
     n_neighbors: int = 8,
-    radius: Union[str, float] = 'auto',
     verbose: bool = False,
-    device: Optional[str] = None,
     copy: bool = True
 ) -> Dict:
     """
-    Process spatial transcriptomics data for DOT.
-
-    GPU-accelerated neighbour search via rapids-singlecell when available,
-    otherwise uses sklearn ball-tree on CPU.
+    Process spatial transcriptomics data.
 
     Parameters
     ----------
     adata : AnnData
-        Spatial data with raw counts in .X and coordinates in .obsm[spatial_key]
+        Spatial data with counts in .X
     spatial_key : str
-        Key in adata.obsm for spatial coordinates
+        Key in adata.obsm containing spatial coordinates
     th_spatial : float
-        Cosine-similarity threshold for adjacent spots
+        Cosine similarity threshold for spatial pairs
     th_nonspatial : float
-        Threshold for non-adjacent similar spots (0 = disabled)
-    th_gene_low / th_gene_high : float
-        Gene frequency filters
-    remove_mt : bool
-        Remove MT / HLA / RPL genes
+        Threshold for non-spatial pairs (0 to disable)
+    max_pairs : int
+        Maximum number of pairs to return
+    radius : str or float
+        Spatial radius ('auto' or numeric value)
     n_neighbors : int
-        Neighbours used to estimate radius when ``radius='auto'``
-    radius : float or ``'auto'``
-        Spatial neighbourhood radius
+        Number of neighbors for radius estimation
     verbose : bool
         Print progress
-    device : str, optional
-        ``'cuda'`` or ``'cpu'``
     copy : bool
-        Copy adata before processing
+        Copy adata
 
     Returns
     -------
     dict
-        ``X_sparse``, ``coords``, ``pairs``, ``genes``, ``device``
+        'X_sparse', 'coords', 'genes', 'pairs'
     """
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    pp = _get_pp(device)
-    use_gpu_pp = device == 'cuda' and _check_rapids()
-
-    if verbose:
-        backend = "rapids-singlecell (GPU)" if use_gpu_pp else "scanpy (CPU)"
-        print(f"Preprocessing spatial data with {backend}...")
-        print(f"Input shape: {adata.shape}")
-
     if copy:
         adata = adata.copy()
 
-    # Coordinates
     if spatial_key not in adata.obsm:
         raise ValueError(f"Spatial coordinates not found in adata.obsm['{spatial_key}']")
     coords = np.asarray(adata.obsm[spatial_key])
     if coords.shape[1] > 2:
         coords = coords[:, :2]
 
-    # Remove MT genes
-    if remove_mt:
-        mt_mask = adata.var_names.str.match('^MT-|^mt-|^RPL') # |^HLA-
-        n_mt = mt_mask.sum()
-        if n_mt > 0:
-            adata = adata[:, ~mt_mask].copy()
-            if verbose:
-                print(f"Removed {n_mt} MT/RPL genes") # HLA/
-
-    # Gene frequency filter
-    sc.pp.filter_genes(adata, min_cells=int(th_gene_low * adata.shape[0]))
-    gene_freq = np.asarray((adata.X > 0).mean(axis=0)).flatten()
-    valid = gene_freq < th_gene_high
-    adata = adata[:, valid].copy()
-
-    if verbose:
-        print(f"Filtered to {adata.shape[1]} genes")
-
     X = adata.X
     genes = adata.var_names.values
+
+    if verbose:
+        print(f"Processing spatial data: {X.shape}")
 
     result = {
         'X_sparse': X,
         'coords': coords,
-        'genes': genes,
-        'device': device
+        'genes': genes
     }
 
-    # Spatial pairs
     if th_spatial > 0:
+        if issparse(X):
+            X_norm = sk_normalize(X, norm='l2', axis=1, copy=True)
+        else:
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            X_norm = X / norms
+
         if verbose:
             print("Finding spatial neighbours...")
-        pairs = _get_spatial_pairs(
-            adata, coords, th_spatial, th_nonspatial,
-            radius, n_neighbors, device, verbose
+
+        pairs_dict = _get_spatial_pairs(
+            X_norm, coords, th_spatial, th_nonspatial,
+            radius, n_neighbors, max_pairs, verbose
         )
-        result['pairs'] = pairs
+        result['pairs'] = pairs_dict
 
     if verbose:
         print(f"Spatial data prepared: {X.shape[0]} spots, {X.shape[1]} genes")
@@ -354,206 +521,18 @@ def setup_spatial(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-def _make_pca_safe_layer(adata, eps=1e-6):
-    X = adata.X
-    if issparse(X):
-        mean = np.asarray(X.mean(axis=0)).ravel()
-        mean_sq = np.asarray(X.power(2).mean(axis=0)).ravel()
-        var = mean_sq - mean**2
-    else:
-        var = X.var(axis=0)
-
-    zero_var = var == 0
-    if not np.any(zero_var):
-        adata.layers["pca_safe"] = X.copy()
-        return
-
-    X_safe = X.copy()
-    if issparse(X_safe):
-        X_safe = X_safe.tolil()
-        for g in np.where(zero_var)[0]:
-            X_safe[np.random.randint(adata.n_obs), g] = eps
-        X_safe = X_safe.tocsr()
-    else:
-        for g in np.where(zero_var)[0]:
-            X_safe[np.random.randint(adata.n_obs), g] = eps
-
-    adata.layers["pca_safe"] = X_safe
-
-
-def _aggregate_reference(
-    X, annotations, adata, cluster_size, device='cpu', verbose=False
-):
-    """Aggregate reference with subclustering (GPU-aware Leiden when possible)."""
-    pp = _get_pp(device)
-    tl = _get_tl(device)
-    use_gpu = device == 'cuda' and _check_rapids()
-
-    major_types = np.unique(annotations)
-    major_centroids = []
-    major_ratios = {}
-
-    for ct in major_types:
-        mask = annotations == ct
-        if issparse(X):
-            major_centroids.append(np.asarray(X[mask].mean(axis=0)).flatten())
-        else:
-            major_centroids.append(X[mask].mean(axis=0))
-        major_ratios[ct] = int(mask.sum())
-
-    total = sum(major_ratios.values())
-    major_ratios = {k: v / total for k, v in major_ratios.items()}
-
-    if issparse(X):
-        major_centroids_mat = vstack([csr_matrix(c) for c in major_centroids])
-    else:
-        major_centroids_mat = np.array(major_centroids)
-
-    if cluster_size <= 1:
-        return {
-            'major_centroids': major_centroids_mat,
-            'major_ratios': major_ratios,
-            'sub_centroids': major_centroids_mat,
-            'clusters': {ct: [i] for i, ct in enumerate(major_types)}
-        }
-
-    # --- Subcluster each cell type ---
-    sub_centroids = []
-    clusters = {}
-
-    for ct in major_types:
-        mask = annotations == ct
-        ct_adata = adata[mask].copy()
-
-        if ct_adata.shape[0] <= 1:
-            continue
-
-        if ct_adata.shape[0] > 10000:
-            sc.pp.subsample(ct_adata, n_obs=10000)
-
-        _make_pca_safe_layer(ct_adata)
-
-        K = min(cluster_size, max(1, int(2 * np.log(ct_adata.shape[0]) - 7)))
-
-        if K <= 1:
-            if issparse(ct_adata.layers['counts']):
-                centroid = np.asarray(ct_adata.layers['counts'].mean(axis=0)).flatten()
-            else:
-                centroid = ct_adata.layers['counts'].mean(axis=0)
-            sub_centroids.append(centroid)
-            clusters[ct] = [len(sub_centroids) - 1]
-        else:
-            if verbose:
-                print(f"  Clustering {ct_adata.shape[0]} {ct} cells into ~{K} clusters...")
-
-            # Use rapids on GPU if available
-            if use_gpu:
-                _to_gpu_anndata(ct_adata)
-
-            n_nbrs = min(15, ct_adata.shape[0] - 1)
-            pp.pca(ct_adata, layer='pca_safe')
-            pp.neighbors(ct_adata, n_neighbors=n_nbrs, use_rep='X_pca')
-            resolution = K / 10.0
-            tl.leiden(ct_adata, resolution=resolution, key_added='subcluster')
-
-            if use_gpu:
-                _to_cpu_anndata(ct_adata)
-
-            sub_labels = ct_adata.obs['subcluster'].astype(str).values
-            unique_labels = np.unique(sub_labels)
-
-            cluster_ids = []
-            # Ensure counts layer is on CPU (anndata_to_GPU may have converted it)
-            counts_X = ct_adata.layers['counts']
-            if hasattr(counts_X, 'get'):
-                # cupy array/sparse → numpy/scipy
-                counts_X = counts_X.get()
-            for lab in unique_labels:
-                lab_mask = sub_labels == lab
-                if issparse(counts_X):
-                    sc_centroid = np.asarray(counts_X[lab_mask].mean(axis=0)).flatten()
-                else:
-                    sc_centroid = counts_X[lab_mask].mean(axis=0)
-                sub_centroids.append(sc_centroid)
-                cluster_ids.append(len(sub_centroids) - 1)
-            clusters[ct] = cluster_ids
-
-    if issparse(X):
-        sub_centroids_mat = vstack([csr_matrix(c) for c in sub_centroids])
-    else:
-        sub_centroids_mat = np.array(sub_centroids)
-
-    return {
-        'major_centroids': major_centroids_mat,
-        'major_ratios': major_ratios,
-        'sub_centroids': sub_centroids_mat,
-        'clusters': clusters
-    }
-
-
-def _get_de_genes(centroids, clusters, max_genes, verbose=False):
-    """Select DE genes using scanpy rank_genes_groups."""
-    if centroids.shape[1] <= max_genes:
-        return np.arange(centroids.shape[1])
-
-    centroids_dense = centroids.toarray() if issparse(centroids) else centroids
-    C, G = centroids_dense.shape
-
-    adata_tmp = AnnData(X=centroids_dense)
-    labels = []
-    for ct, indices in clusters.items():
-        labels.extend([ct] * len(indices))
-    adata_tmp.obs['cell_type'] = labels
-
-    # Only run if we have >1 group
-    unique_cts = adata_tmp.obs['cell_type'].unique()
-    if len(unique_cts) < 2:
-        gene_var = centroids_dense.var(axis=0)
-        return np.argsort(gene_var)[::-1][:max_genes]
-
-    sc.tl.rank_genes_groups(adata_tmp, groupby='cell_type', method='wilcoxon', use_raw=False)
-
-    de_set = set()
-    n_per = max(50, max_genes // len(clusters))
-    for ct in clusters:
-        ct_genes = adata_tmp.uns['rank_genes_groups']['names'][ct][:n_per]
-        de_set.update(ct_genes)
-
-    if len(de_set) < max_genes:
-        gene_var = centroids_dense.var(axis=0)
-        for idx in np.argsort(gene_var)[::-1]:
-            de_set.add(adata_tmp.var_names[idx])
-            if len(de_set) >= max_genes:
-                break
-
-    de_idx = [adata_tmp.var_names.get_loc(g) for g in list(de_set)[:max_genes]]
-    if verbose:
-        print(f"Selected {len(de_idx)} DE genes")
-    return np.array(de_idx)
-
-
 def _get_spatial_pairs(
-    adata, coords, th_spatial, th_nonspatial,
-    radius, n_neighbors, device, verbose
+    X_norm, coords, th_spatial, th_nonspatial,
+    radius, n_neighbors, max_pairs, verbose
 ):
-    """
-    Find spatial pairs.  Uses vectorised cosine similarity in batches
-    to avoid O(N²) memory.  GPU-accelerated radius search via cuML
-    when rapids is available.
-    """
-    from sklearn.neighbors import NearestNeighbors
-    from sklearn.preprocessing import normalize as sk_normalize
-
+    """Find spatial pairs using radius search."""
     N = coords.shape[0]
 
-    # --- Estimate radius ---
     if radius == 'auto':
         nbrs_est = NearestNeighbors(
             n_neighbors=min(n_neighbors + 1, N),
-            algorithm='ball_tree', metric='euclidean'
+            algorithm='ball_tree',
+            metric='euclidean'
         )
         nbrs_est.fit(coords)
         dists, _ = nbrs_est.kneighbors(coords)
@@ -561,30 +540,18 @@ def _get_spatial_pairs(
         if verbose:
             print(f"Estimated spatial radius: {radius:.2f}")
 
-    # --- Find neighbours within radius ---
     if verbose:
-        print(f"Finding spatial neighbours within radius {radius:.2f}...")
+        print(f"Finding spatial neighbors (radius={radius:.2f})...")
 
     nbrs = NearestNeighbors(radius=radius, algorithm='ball_tree', metric='euclidean')
     nbrs.fit(coords)
     distances_list, indices_list = nbrs.radius_neighbors(coords)
 
-    # --- Normalise expression for cosine similarity ---
-    X = adata.X
-    if issparse(X):
-        X_norm = sk_normalize(X, norm='l2', axis=1, copy=True)
-    else:
-        norms = np.linalg.norm(X, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        X_norm = X / norms
-
-    # --- Vectorised pair construction ---
-    # Build flat arrays of (i, j) pairs from ball-tree results
     all_i = []
     all_j = []
     for i in range(N):
         nbr = indices_list[i]
-        mask = nbr > i  # upper triangle only
+        mask = nbr > i
         js = nbr[mask]
         if len(js) > 0:
             all_i.append(np.full(len(js), i, dtype=np.int64))
@@ -592,13 +559,12 @@ def _get_spatial_pairs(
 
     if len(all_i) == 0:
         if verbose:
-            print("No spatial pairs found within radius")
+            print("No spatial pairs found")
         return None
 
     i_idx = np.concatenate(all_i)
     j_idx = np.concatenate(all_j)
 
-    # Compute cosine similarities in batches to limit memory
     PAIR_BATCH = 500_000
     n_pairs = len(i_idx)
     weights = np.empty(n_pairs, dtype=np.float64)
@@ -609,7 +575,6 @@ def _get_spatial_pairs(
         bj = j_idx[start:end]
 
         if issparse(X_norm):
-            # Sparse row-wise dot product via element-wise multiply + sum
             Xi = X_norm[bi]
             Xj = X_norm[bj]
             sims = np.asarray(Xi.multiply(Xj).sum(axis=1)).flatten()
@@ -618,14 +583,19 @@ def _get_spatial_pairs(
 
         weights[start:end] = sims
 
-    # Filter by threshold
     valid = weights >= th_spatial
     i_idx = i_idx[valid]
     j_idx = j_idx[valid]
     weights = weights[valid]
 
+    if len(i_idx) > max_pairs:
+        top_idx = np.argsort(weights)[::-1][:max_pairs]
+        i_idx = i_idx[top_idx]
+        j_idx = j_idx[top_idx]
+        weights = weights[top_idx]
+
     if verbose:
-        print(f"Found {len(i_idx)} spatial pairs (th_spatial={th_spatial})")
+        print(f"Found {len(i_idx)} spatial pairs")
 
     if len(i_idx) == 0:
         return None
