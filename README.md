@@ -2,15 +2,17 @@
 
 **Deconvolution by Optimal Transport for Spatial Transcriptomics**
 
-A PyTorch implementation of the DOT algorithm for transferring cell type annotations from single-cell RNA-seq reference data to spatial transcriptomics data using multi-objective optimization.
+A Python implementation of the DOT algorithm for transferring cell type annotations from single-cell RNA-seq reference data to spatial transcriptomics data using multi-objective optimization.
 
 ## Features
 
-- 🚀 **GPU acceleration** using PyTorch and RAPIDS-singlecell for fast computation
+- 🚀 **GPU acceleration** using PyTorch for fast computation
 - 🧬 **AnnData integration** - seamlessly works with scanpy workflows
 - 🎯 **Multi-objective optimization** using Frank-Wolfe algorithm
 - 📊 **High & low resolution support** - works with both subcellular (Xenium, MERFISH, CosMx) and spot-based (Visium, ST) technologies
 - 🎨 **Built-in visualization** tools for spatial cell type mapping
+- 💾 **Checkpointing** for long-running optimizations
+- ⚡ **Mixed precision** support for memory-efficient GPU training
 
 ## Installation
 
@@ -45,10 +47,11 @@ from dotpy import DOT, setup_reference, setup_spatial, plot_spatial_weights
 ref_adata = sc.read_h5ad('reference.h5ad')
 spatial_adata = sc.read_h5ad('spatial.h5ad')
 
-# Process (stays sparse!)
+# Process reference and spatial data
 ref_processed = setup_reference(
     ref_adata,
     cell_type_key='cell_type',
+    subcluster_size=10,
     max_genes=5000,
     verbose=True
 )
@@ -56,6 +59,7 @@ ref_processed = setup_reference(
 spatial_processed = setup_spatial(
     spatial_adata,
     spatial_key='spatial',
+    th_spatial=0.84,
     verbose=True
 )
 
@@ -63,7 +67,7 @@ spatial_processed = setup_spatial(
 dot = DOT(
     spatial_processed, 
     ref_processed,
-    batch_size=500  # Adjust for your GPU
+    batch_size=500  # Adjust for your GPU memory
 )
 
 dot.fit(
@@ -82,7 +86,9 @@ cell_types = dot.get_cell_types()
 plot_spatial_weights(
     spatial_adata.obsm['spatial'],
     weights,
-    cell_types=cell_types
+    cell_types=cell_types,
+    ncols=4,
+    save_path='cell_type_maps.png'
 )
 ```
 
@@ -145,9 +151,11 @@ The optimization is performed using the Frank-Wolfe algorithm, which efficiently
 ref_processed = setup_reference(
     ref_adata,
     cell_type_key='cell_type',
-    subcluster_size=15,  # More subclusters per cell type
-    max_genes=10000,      # Use more genes
-    remove_mt=True,       # Remove mitochondrial genes
+    subcluster_size=15,      # More subclusters per cell type
+    max_genes=10000,         # Use more genes
+    remove_mt=True,          # Remove mitochondrial genes
+    th_inner_logfold=0.75,   # Log-fold threshold for gene selection
+    random_state=42,         # For reproducibility
     verbose=True
 )
 
@@ -155,20 +163,32 @@ ref_processed = setup_reference(
 spatial_processed = setup_spatial(
     spatial_adata,
     spatial_key='spatial',
-    th_spatial=0.80,       # Adjust spatial similarity threshold
-    th_nonspatial=0.0,     # Include non-adjacent similar spots
-    th_gene_low=0.01,      # Minimum gene expression frequency
-    th_gene_high=0.99,     # Maximum gene expression frequency
-    radius='auto',         # Or specify numeric value
+    th_spatial=0.80,         # Adjust spatial similarity threshold
+    th_gene_low=0.01,        # Minimum gene expression frequency
+    th_gene_high=0.99,       # Maximum gene expression frequency
+    radius='auto',           # Or specify numeric value
+    remove_mt=True,          # Remove mitochondrial genes
     verbose=True
+)
+
+# DOT with custom device and optimization settings
+import torch
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+dot = DOT(
+    spatial_processed,
+    ref_processed,
+    batch_size=500,          # Adjust for GPU memory
+    device=device            # Explicitly set device
 )
 
 # Fine-tune optimization
 dot.fit(
     mode='highres',
-    ratios_weight=0.2,     # Weight for abundance matching
-    iterations=200,         # More iterations
-    gap_threshold=0.001,    # Tighter convergence
+    ratios_weight=0.2,       # Weight for abundance matching
+    iterations=200,          # More iterations
+    gap_threshold=0.001,     # Tighter convergence
+    use_mixed_precision=True,  # Use float16 on GPU
     verbose=True
 )
 ```
@@ -176,17 +196,17 @@ dot.fit(
 ### GPU/CPU Selection
 
 ```python
-# Explicitly specify device
-ref_processed = setup_reference(
-    ref_adata,
-    cell_type_key='cell_type',
-    device='cuda'  # or 'cpu'
-)
-
 # Check if CUDA is available
 import torch
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
+
+# Pass device to DOT
+dot = DOT(
+    spatial_processed,
+    ref_processed,
+    device=device
+)
 ```
 
 ### Saving Results
@@ -279,8 +299,15 @@ ref_processed = setup_reference(
     ...
 )
 
-# Process in batches if needed
-# (split spatial data into tiles)
+# Use smaller batch size
+dot = DOT(spatial, ref, batch_size=100)
+
+# Enable mixed precision on GPU
+dot.fit(
+    mode='highres',
+    use_mixed_precision=True,
+    iterations=100
+)
 ```
 
 ### Speed vs Accuracy
@@ -328,8 +355,11 @@ Nat Commun 15, 4994 (2024). https://doi.org/10.1038/s41467-024-48868-z
 # Solution 1: Reduce batch size
 dot = DOT(spatial, ref, batch_size=100)
 
-# Solution 2: Use CPU
-ref = setup_reference(adata, device='cpu')
+# Solution 2: Enable mixed precision
+dot.fit(mode='highres', use_mixed_precision=True)
+
+# Solution 3: Use CPU
+dot = DOT(spatial, ref, device='cpu')
 ```
 
 ### "Too slow on CPU"

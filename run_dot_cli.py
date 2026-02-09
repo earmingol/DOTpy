@@ -174,7 +174,6 @@ def main():
         cell_type_key=args.cell_type_key,
         subcluster_size=args.subcluster_size,
         max_genes=args.max_genes,
-        device=device,
         verbose=args.verbose
     )
 
@@ -202,8 +201,8 @@ def main():
     # Track lineage mapping dictionary
     lin_dict = None
     if args.lineage_key is not None and args.lineage_key in ref_adata.obs.columns:
-        lin_dict = (ref_adata.obs[[cell_type_key, lineage_key]]
-                    .groupby(cell_type_key)[lineage_key]
+        lin_dict = (ref_adata.obs[[args.cell_type_key, args.lineage_key]]
+                    .groupby(args.cell_type_key)[args.lineage_key]
                     .agg(lambda x: x.value_counts().idxmax())
                     .to_dict()
                 )
@@ -240,12 +239,16 @@ def main():
             spatial_key='spatial',
             th_spatial=args.th_spatial,
             radius='auto',
-            device=device,
             verbose=args.verbose
         )
 
         # Run DOT
-        dot = DOT(spatial_processed, ref_processed, batch_size=args.batch_size)
+        dot = DOT(
+            spatial_processed,
+            ref_processed,
+            batch_size=args.batch_size,
+            device=device
+        )
 
         # Per-sample checkpoint dir (when multiple samples)
         ckpt_dir = None

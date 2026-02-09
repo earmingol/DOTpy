@@ -70,6 +70,7 @@ Your data should be in AnnData format with:
 
 ```python
 import scanpy as sc
+import torch
 from dotpy import setup_reference, setup_spatial, DOT, plot_spatial_weights
 
 # 1. Load your data
@@ -94,24 +95,33 @@ spatial_processed = setup_spatial(
     verbose=True
 )
 
-# 3. Run deconvolution
-print("Running DOT...")
-dot = DOT(spatial_processed, ref_processed)
+# 3. Setup DOT with device selection
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Running on: {device}")
 
+dot = DOT(
+    spatial_processed, 
+    ref_processed,
+    batch_size=500,  # Adjust based on GPU memory
+    device=device
+)
+
+# 4. Run deconvolution
+print("Running DOT...")
 # For high-resolution data (Xenium, MERFISH, CosMx)
 dot.fit(mode='highres', iterations=100, verbose=True)
 
 # OR for low-resolution data (Visium, ST)
 # dot.fit(mode='lowres', max_spot_size=20, iterations=100, verbose=True)
 
-# 4. Get results
+# 5. Get results
 weights = dot.get_weights(normalize=True)
 cell_types = dot.get_cell_types()
 
 print(f"\nDeconvolution complete!")
 print(f"Identified {len(cell_types)} cell types in {weights.shape[0]} spots")
 
-# 5. Visualize
+# 6. Visualize
 plot_spatial_weights(
     spatial_adata.obsm['spatial'],
     weights,
@@ -120,7 +130,7 @@ plot_spatial_weights(
     save_path='cell_type_maps.png'
 )
 
-# 6. Save results
+# 7. Save results
 spatial_adata.obsm['dot_weights'] = weights
 for i, ct in enumerate(cell_types):
     spatial_adata.obs[f'dot_{ct}'] = weights[:, i]
@@ -137,18 +147,20 @@ print("Results saved!")
 ref_processed = setup_reference(
     adata,
     cell_type_key='cell_type',  # Column with cell type labels
-    subcluster_size=10,          # Max subclusters per cell type (higher = more granular)
-    max_genes=5000,              # Number of genes to use (higher = more info, slower)
-    remove_mt=True,              # Remove mitochondrial genes
-    verbose=True,                # Print progress
-    device='cuda'                # 'cuda' for GPU, 'cpu' for CPU
+    subcluster_size=10,         # Max subclusters per cell type (higher = more granular)
+    max_genes=5000,             # Number of genes to use (higher = more info, slower)
+    remove_mt=True,             # Remove mitochondrial genes
+    th_inner_logfold=0.75,      # Log-fold threshold for gene selection in subclustering
+    random_state=42,            # Random seed for reproducibility
+    verbose=True,               # Print progress
+    copy=True                   # Copy adata before processing
 )
 ```
 
 **When to adjust:**
 - Increase `subcluster_size` for more heterogeneous cell types
 - Increase `max_genes` if you have many similar cell types
-- Use `device='cpu'` if out of GPU memory
+- Adjust `th_inner_logfold` to control gene selection stringency
 
 ### Spatial Processing
 
@@ -157,20 +169,40 @@ spatial_processed = setup_spatial(
     adata,
     spatial_key='spatial',       # Key in adata.obsm with coordinates
     th_spatial=0.84,             # Similarity threshold for spatial neighbors
-    th_nonspatial=0.0,           # Threshold for non-adjacent pairs (0 = disabled)
     th_gene_low=0.01,            # Min expression frequency
     th_gene_high=0.99,           # Max expression frequency
     remove_mt=True,              # Remove mitochondrial genes
     radius='auto',               # Spatial neighborhood radius
     verbose=True,
-    device='cuda'
+    copy=True
 )
 ```
 
 **When to adjust:**
 - Lower `th_spatial` to include more neighbors (more smoothing)
-- Set `th_nonspatial > 0` to include similar distant spots
 - Set specific `radius` value if auto-detection fails
+- Adjust `th_gene_low`/`th_gene_high` to filter genes by expression frequency
+
+### DOT Initialization
+
+```python
+import torch
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+dot = DOT(
+    spatial_processed,
+    ref_processed,
+    ls_solution=True,            # Use least-squares initialization (recommended)
+    batch_size=500,              # Batch size for GPU processing
+    device=device                # 'cuda' for GPU, 'cpu' for CPU
+)
+```
+
+**When to adjust:**
+- Decrease `batch_size` if running out of GPU memory
+- Set `device='cpu'` if GPU memory is insufficient
+- Set `ls_solution=False` to skip LS initialization (faster but may converge slower)
 
 ### DOT Fitting
 
@@ -181,6 +213,10 @@ dot.fit(
     ratios_weight=0.0,           # Weight for matching reference abundances (0-1)
     iterations=100,              # Number of optimization iterations
     gap_threshold=0.01,          # Convergence threshold
+    use_mixed_precision=False,   # Use float16 on GPU (saves memory)
+    checkpoint_dir=None,         # Directory to save checkpoints
+    checkpoint_freq=10,          # Save checkpoint every N iterations
+    resume_from=None,            # Path to checkpoint to resume from
     verbose=True
 )
 
@@ -199,6 +235,7 @@ dot.fit(
 - Increase `ratios_weight` if you trust reference proportions
 - Increase `iterations` if not converging (check `dot.history`)
 - Decrease `gap_threshold` for tighter convergence (slower)
+- Enable `use_mixed_precision=True` on GPU to reduce memory usage
 
 ## Common Issues and Solutions
 
@@ -219,21 +256,23 @@ spatial_adata.var_names = spatial_adata.var_names.str.upper()
 
 **Solutions:**
 ```python
-# Option 1: Reduce genes
+# Option 1: Reduce batch size
+dot = DOT(spatial_processed, ref_processed, batch_size=100)
+
+# Option 2: Use mixed precision
+dot.fit(mode='highres', use_mixed_precision=True)
+
+# Option 3: Reduce genes
 ref_processed = setup_reference(
     ref_adata,
     max_genes=2000,  # Reduced from 5000
     ...
 )
 
-# Option 2: Use CPU
-ref_processed = setup_reference(
-    ref_adata,
-    device='cpu',
-    ...
-)
+# Option 4: Use CPU
+dot = DOT(spatial_processed, ref_processed, device='cpu')
 
-# Option 3: Clear cache
+# Option 5: Clear cache
 import torch
 torch.cuda.empty_cache()
 ```
@@ -275,7 +314,9 @@ sc.pl.umap(ref_adata, color='cell_type')
 ### For Large Datasets
 
 ```python
-# 1. Use GPU
+import torch
+
+# 1. Check if GPU is available
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # 2. Reduce genes
@@ -284,7 +325,14 @@ max_genes = 3000  # Instead of 5000
 # 3. Fewer subclusters
 subcluster_size = 5  # Instead of 10
 
-# 4. Subset spatial data for testing
+# 4. Use appropriate batch size
+if device == 'cuda':
+    mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    batch = 100 if mem_gb < 6 else (500 if mem_gb < 12 else 1000)
+else:
+    batch = 500
+
+# 5. Subset spatial data for testing
 spatial_subset = spatial_adata[::10].copy()  # Every 10th spot
 ```
 
@@ -293,11 +341,33 @@ spatial_subset = spatial_adata[::10].copy()  # Every 10th spot
 ```python
 import torch
 
-print(f"GPU Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-print(f"GPU Memory cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+if torch.cuda.is_available():
+    print(f"GPU Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+    print(f"GPU Memory cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+    
+    # Clear cache if needed
+    torch.cuda.empty_cache()
+```
 
-# Clear cache if needed
-torch.cuda.empty_cache()
+### Using Checkpoints
+
+```python
+# Save checkpoints during long runs
+dot.fit(
+    mode='highres',
+    iterations=200,
+    checkpoint_dir='./checkpoints',
+    checkpoint_freq=20,  # Save every 20 iterations
+    verbose=True
+)
+
+# Resume from checkpoint
+dot.fit(
+    mode='highres',
+    iterations=300,  # Continue to 300 total
+    resume_from='./checkpoints/checkpoint_iter_200.pkl',
+    verbose=True
+)
 ```
 
 ## Next Steps
