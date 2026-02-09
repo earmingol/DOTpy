@@ -13,5 +13,5 @@ from .core import DOT
 from .preprocessing import setup_reference, setup_spatial
 from .visualization import plot_spatial_weights
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 __all__ = ["DOT", "setup_reference", "setup_spatial", "plot_spatial_weights"]
