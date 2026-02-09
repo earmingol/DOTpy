@@ -202,11 +202,11 @@ def main():
     # Track lineage mapping dictionary
     lin_dict = None
     if args.lineage_key is not None and args.lineage_key in ref_adata.obs.columns:
-        lin_dict = (
-            ref_adata.obs[[args.lineage_key, args.cell_type_key]]
-            .set_index(args.cell_type_key, drop=True)
-            .to_dict()[args.lineage_key]
-        )
+        lin_dict = (ref_adata.obs[[cell_type_key, lineage_key]]
+                    .groupby(cell_type_key)[lineage_key]
+                    .agg(lambda x: x.value_counts().idxmax())
+                    .to_dict()
+                )
 
     # Initialize as string columns to avoid categorical issues during loop
     spatial_adata.obs['cell_type'] = ''
