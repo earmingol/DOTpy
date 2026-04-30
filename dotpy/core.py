@@ -251,15 +251,48 @@ class DOT:
         # ============================================================
         # 3. Initialise solution Yt  (C × S) on device
         # ============================================================
-        if self.solution is None:
+        Yt = None
+        if self.solution is not None:
+            Yt_cand = torch.from_numpy(self.solution.astype(np.float32)).to(device)
+            if Yt_cand.shape == (C, S):
+                Yt_cand.clamp_(min=0)
+                cs = Yt_cand.sum(dim=0)
+                small = cs < 1e-3
+                if small.any():
+                    Yt_cand[:, small] = 1.0 / C
+
+                cs_factors = torch.ones(S, device=device)
+                if sparsity_coef > 0.5:
+                    cs_factors[~small] = 1.0 / cs[~small]
+                else:
+                    cs_high = cs > max_size
+                    cs_factors[cs_high] = max_size / cs[cs_high]
+                    cs_low = (cs < min_size) & ~small
+                    cs_factors[cs_low] = min_size / cs[cs_low]
+
+                Yt_cand.mul_(cs_factors.unsqueeze(0))
+                if (Yt_cand == 0).any():
+                    cs_weight = 0.99
+                    Yt_cand = Yt_cand * cs_weight + (1.0 - cs_weight) / C
+                Yt = Yt_cand
+
+        if Yt is None:
             initial = torch.zeros(C, device=device)
             for k, ct in enumerate(cell_types):
                 idx_t = major_idx_tensors[k]
                 initial[idx_t] = sc_ratios_t[k] / len(idx_t)
             Yt = initial.unsqueeze(1) * r_st_t.unsqueeze(0)
-        else:
-            Yt = torch.from_numpy(self.solution.astype(np.float32)).to(device)
-            Yt.clamp_(min=0)
+
+            mix_weight = 0.1
+            Yt = Yt * mix_weight
+
+            X_sp_n = F.normalize(X_sp, p=2, dim=1)
+            linear_dcosine = 1 - X_ref_norm @ X_sp_n.T
+            c_min = linear_dcosine.argmin(dim=0)
+            s_idx = torch.arange(S, device=device)
+            Yt[c_min, s_idx] += (1 - mix_weight) * r_st_t
+
+            del X_sp_n, linear_dcosine
 
         # ============================================================
         # 4. Optimisation loop
@@ -331,8 +364,8 @@ class DOT:
 
                         csi = (Xsp_b * st_xt_n).sum(dim=1)
                         di = (1 - csi).clamp(min=0)
-                        d_i_grad = 0.5 / (di.sqrt() + 1e-10)
-                        di_sqrt = di.sqrt()
+                        d_i_grad = _sqrt_env_grad(di)
+                        di_sqrt = _sqrt_env(di)
                         dcosine_st += di_sqrt.sum().item()
 
                         coef = l_i * (1 - sparsity_coef)
@@ -370,8 +403,8 @@ class DOT:
 
                 csg = (st_gn * X_sp_col_norm).sum(dim=0)        # G
                 dg = (1 - csg).clamp(min=0)
-                dg_coefs = 0.5 / (dg.sqrt() + 1e-10) / st_gnorms.squeeze(0)
-                dg.sqrt_()
+                dg_coefs = _sqrt_env_grad(dg) / st_gnorms.squeeze(0)
+                dg = _sqrt_env(dg)
                 dcosine_g = dg.sum().item()
 
                 # gradient  S × G
@@ -473,10 +506,25 @@ class DOT:
                 )
 
             # Convergence
-            if rel_gap <= gap_threshold and iteration >= 10:
-                if verbose:
-                    print(f"Converged at iteration {iteration}")
-                break
+            converged = rel_gap <= gap_threshold and iteration >= 10
+            if converged:
+                # R: continue if best-objective dropped > gap_threshold over last ~5 iters
+                look_back_iter = max(2, iteration - 5)
+                look_back_idx = look_back_iter - start_iteration
+                still_improving = False
+                if 0 <= look_back_idx < len(history['upper_bound']):
+                    f_old = history['upper_bound'][look_back_idx]
+                    if f_old is not None and abs(f_best) > 1e-10:
+                        if (f_old - f_best) / abs(f_best) >= gap_threshold:
+                            still_improving = True
+                if still_improving:
+                    lb = float('-inf')
+                    if verbose:
+                        print(f"Iter {iteration}: resetting LB, still improving")
+                else:
+                    if verbose:
+                        print(f"Converged at iteration {iteration}")
+                    break
             if step <= 1e-5:
                 if verbose:
                     print(f"Step size too small at iteration {iteration}")
@@ -557,3 +605,22 @@ def _safe_log2(x: torch.Tensor) -> torch.Tensor:
     out = torch.log2(x.clamp(min=1e-10))
     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=-20.0)
     return out
+
+
+_ENV_MIN = 1e-2
+_ENV_SLOPE = 0.25 / _ENV_MIN
+_ENV_THRESHOLD = 4 * _ENV_MIN ** 2
+
+
+def _sqrt_env(v: torch.Tensor) -> torch.Tensor:
+    """sqrt clamped near zero with linear envelope (matches R sqrt_env)."""
+    return torch.where(v < _ENV_THRESHOLD, _ENV_SLOPE * v + _ENV_MIN, v.sqrt())
+
+
+def _sqrt_env_grad(v: torch.Tensor) -> torch.Tensor:
+    """Gradient of sqrt_env (matches R sqrt_env_grad)."""
+    return torch.where(
+        v < _ENV_THRESHOLD,
+        torch.full_like(v, _ENV_SLOPE),
+        0.5 / (v.sqrt() + 1e-10),
+    )

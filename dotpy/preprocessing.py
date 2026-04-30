@@ -287,8 +287,13 @@ def _aggregate_reference(
     else:
         sub_centroids = np.array(sub_centroids_list)
 
+    surviving = {ct: major_ratios[ct] for ct in clusters.keys() if ct in major_ratios}
+    total = sum(surviving.values())
+    if total > 0:
+        major_ratios = {ct: v / total for ct, v in surviving.items()}
+
     if verbose:
-        print(f"Created {len(sub_centroids_list)} sub-clusters from {len(major_types)} cell types")
+        print(f"Created {len(sub_centroids_list)} sub-clusters from {len(clusters)} cell types")
 
     return {
         'major_centroids': major_centroids,
@@ -353,29 +358,28 @@ def setup_reference(
     sc.pp.filter_genes(adata, min_cells=1)
 
     if remove_mt:
-        mt_mask = adata.var_names.str.match('^MT-|^mt-|^RPL')
+        mt_mask = adata.var_names.str.startswith(('MT-', 'HLA-', 'RPL'))
         n_mt = mt_mask.sum()
         if n_mt > 0:
             adata = adata[:, ~mt_mask].copy()
             if verbose:
-                print(f"Removed {n_mt} MT/RPL genes")
+                print(f"Removed {n_mt} MT/HLA/RPL genes")
 
     X = adata.X
     annotations = adata.obs[cell_type_key].values.astype(str)
     genes = adata.var_names.values
 
-    if adata.shape[1] > max_genes:
+    vg_genes = max(5000, max_genes)
+    if adata.shape[1] > vg_genes:
         if verbose:
-            print(f"\nSelecting {max_genes} highly variable genes...")
+            print(f"\nSelecting {vg_genes} highly variable genes...")
 
         adata_hvg = adata.copy()
-        sc.pp.normalize_total(adata_hvg, target_sum=1e4)
-        sc.pp.log1p(adata_hvg)
         adata_hvg.layers['counts'] = adata.X.copy()
 
         sc.pp.highly_variable_genes(
             adata_hvg,
-            n_top_genes=max_genes,
+            n_top_genes=vg_genes,
             flavor='seurat_v3',
             layer='counts',
             subset=False
@@ -437,6 +441,7 @@ def setup_spatial(
     adata: AnnData,
     spatial_key: str = 'spatial',
     th_spatial: float = 0.84,
+    th_nonspatial: float = 0.0,
     th_gene_low: float = 0.01,
     th_gene_high: float = 0.99,
     remove_mt: bool = True,
@@ -489,12 +494,12 @@ def setup_spatial(
 
     # Remove MT genes
     if remove_mt:
-        mt_mask = adata.var_names.str.match('^MT-|^mt-|^RPL')
+        mt_mask = adata.var_names.str.startswith(('MT-', 'HLA-', 'RPL'))
         n_mt = mt_mask.sum()
         if n_mt > 0:
             adata = adata[:, ~mt_mask].copy()
             if verbose:
-                print(f"Removed {n_mt} MT/RPL genes")
+                print(f"Removed {n_mt} MT/HLA/RPL genes")
 
     # Gene frequency filter
     if th_gene_high < 1 or th_gene_low > 0:
@@ -536,7 +541,7 @@ def setup_spatial(
             )
             nbrs_est.fit(coords)
             dists, _ = nbrs_est.kneighbors(coords)
-            radius = float(np.quantile(dists[:, -1], 0.9) * 1.05)
+            radius = float(np.quantile(dists[:, 1:].ravel(), 0.9) * 1.05)
             if verbose:
                 print(f"Estimated spatial radius: {radius:.2f}")
 
@@ -585,6 +590,45 @@ def setup_spatial(
             i_idx = i_idx[valid]
             j_idx = j_idx[valid]
             weights = weights[valid]
+
+            max_pairs = N
+
+            if len(i_idx) > max_pairs:
+                keep = np.argsort(weights)[::-1][:max_pairs]
+                i_idx = i_idx[keep]
+                j_idx = j_idx[keep]
+                weights = weights[keep]
+            elif th_nonspatial > 0 and len(i_idx) < max_pairs:
+                if issparse(X_norm):
+                    sim_full = np.asarray(X_norm @ X_norm.T.toarray()) if hasattr(X_norm, 'toarray') else np.asarray((X_norm @ X_norm.T).todense())
+                else:
+                    sim_full = X_norm @ X_norm.T
+
+                tri_i, tri_j = np.triu_indices(N, k=1)
+                tri_w = sim_full[tri_i, tri_j]
+                mask = tri_w >= th_nonspatial
+                cand_i = tri_i[mask]
+                cand_j = tri_j[mask]
+                cand_w = tri_w[mask]
+
+                existing = set(zip(i_idx.tolist(), j_idx.tolist()))
+                keep_mask = np.array([
+                    (int(a), int(b)) not in existing for a, b in zip(cand_i, cand_j)
+                ], dtype=bool)
+                cand_i = cand_i[keep_mask]
+                cand_j = cand_j[keep_mask]
+                cand_w = cand_w[keep_mask]
+
+                slots = max_pairs - len(i_idx)
+                if len(cand_i) > slots:
+                    top = np.argsort(cand_w)[::-1][:slots]
+                    cand_i = cand_i[top]
+                    cand_j = cand_j[top]
+                    cand_w = cand_w[top]
+
+                i_idx = np.concatenate([i_idx, cand_i.astype(np.int64)])
+                j_idx = np.concatenate([j_idx, cand_j.astype(np.int64)])
+                weights = np.concatenate([weights, cand_w.astype(np.float64)])
 
             if len(i_idx) > 0:
                 if verbose:
