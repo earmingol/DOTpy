@@ -19,7 +19,9 @@ import scanpy as sc
 import squidpy as sq
 import torch
 from pathlib import Path
+import matplotlib.pyplot as plt
 from dotpy import DOT, setup_reference, setup_spatial
+from dotpy.visualization import plot_spatial_weights, plot_optimization_history
 
 try:
     from natsort import natsorted
@@ -72,6 +74,9 @@ def parse_args():
                         help='Number of optimization iterations')
     parser.add_argument('--mode', choices=['highres', 'lowres'], default='highres',
                         help='Resolution mode (highres for Xenium/MERFISH, lowres for Visium)')
+    parser.add_argument('--ratios-weight', type=float, default=0.0,
+                        help='Weight for matching reference cell-type abundances (0 disables; '
+                             'try ~0.3 for lowres deconvolution)')
 
     # Device & performance
     parser.add_argument('--device', choices=['cuda', 'cpu', 'auto'], default='auto',
@@ -257,7 +262,7 @@ def main():
 
         dot.fit(
             mode=args.mode,
-            ratios_weight=0.0,
+            ratios_weight=args.ratios_weight,
             iterations=args.iterations,
             verbose=args.verbose,
             use_mixed_precision=args.mixed_precision,
@@ -344,6 +349,26 @@ def main():
                     )
                     if args.verbose:
                         print(f"  ✓ Saved lineage plot")
+
+                weights_plot_path = figures_dir / f"{args.output}{sample_suffix}_weights.png"
+                fig = plot_spatial_weights(
+                    coords=sample_data.obsm['spatial'],
+                    weights=weights,
+                    cell_types=cell_types,
+                    save_path=str(weights_plot_path),
+                )
+                plt.close(fig)
+                if args.verbose:
+                    print(f"  ✓ Saved weights plot: {weights_plot_path}")
+
+                history_plot_path = figures_dir / f"{args.output}{sample_suffix}_convergence.png"
+                fig = plot_optimization_history(
+                    dot.history,
+                    save_path=str(history_plot_path),
+                )
+                plt.close(fig)
+                if args.verbose:
+                    print(f"  ✓ Saved convergence plot: {history_plot_path}")
 
             except Exception as e:
                 print(f"  Warning: Could not generate plots: {e}")
