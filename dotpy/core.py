@@ -27,8 +27,7 @@ class DOT:
         if len(common_genes) == 0:
             raise ValueError("No common genes found between spatial and reference data")
 
-        # Index both matrices in the same explicit order. Filtering each array with
-        # np.isin() preserves its original order, which may differ after DE ranking.
+        # Index both matrices in the same explicit order so columns correspond.
         sp_lookup = {gene: i for i, gene in enumerate(spatial_genes)}
         rf_lookup = {gene: i for i, gene in enumerate(ref_genes)}
         sp_idx = np.fromiter((sp_lookup[g] for g in common_genes), dtype=np.int64)
@@ -230,9 +229,9 @@ class DOT:
         X_ref = torch.from_numpy(X_ref_np).to(device)      # C × G
         X_sp = torch.from_numpy(X_sp_np).to(device)         # S × G
         X_ref_norm = F.normalize(X_ref, p=2, dim=1)         # C × G  (L2-normed rows)
-        # R DOT computes ST_Xn <- normalize(ST_X) once and uses it in both
-        # spot-wise cosine terms.
-        X_sp_row_norm = F.normalize(X_sp, p=2, dim=1)       # S × G
+        X_sp_row_norm = F.normalize(X_sp, p=2, dim=1)       # S × G  (spot-wise cosine + linear sparsity)
+        X_sp_col_norm = F.normalize(X_sp, p=2, dim=0)       # S × G  (gene-wise cosine)
+        del X_sp                                              # free – raw spatial no longer needed
 
         c2m = torch.from_numpy(cluster_to_major).to(device)
         r_sc_t = torch.from_numpy(r_sc).to(device)
@@ -356,8 +355,7 @@ class DOT:
                     s0 = b * batch
                     s1 = min(s0 + batch, S)
                     Yt_b = Yt[:, s0:s1]                       # C × b
-                    Xsp_b = X_sp[s0:s1]                        # b × G
-                    Xsp_b_n = X_sp_row_norm[s0:s1]             # b × G
+                    Xsp_b_n = X_sp_row_norm[s0:s1]             # b × G  (L2-normed rows)
 
                     # predicted expression  b × G
                     if compute_dtype == torch.float16:
@@ -406,8 +404,6 @@ class DOT:
 
                 st_gnorms = st_xt_full.norm(dim=0, keepdim=True).clamp(min=1e-10)
                 st_gn = st_xt_full / st_gnorms                  # S × G
-
-                X_sp_col_norm = F.normalize(X_sp, p=2, dim=0)   # S × G
 
                 csg = (st_gn * X_sp_col_norm).sum(dim=0)        # G
                 dg = (1 - csg).clamp(min=0)
