@@ -103,6 +103,141 @@ dot.fit(
 )
 ```
 
+## Command-Line Interface
+
+For production workflows or batch processing, DOTpy includes a CLI script (`run_dot_cli.py`) that runs the full pipeline from the terminal without writing any Python code.
+
+### Basic usage
+
+```bash
+python run_dot_cli.py --ref reference.h5ad --spatial spatial.h5ad
+```
+
+### Multi-sample processing
+
+When a single AnnData object contains multiple tissue sections or slides, the CLI can iterate through each sample automatically using `--sample-key`. Each sample is preprocessed, deconvolved, and saved independently, with GPU memory freed between runs:
+
+```bash
+python run_dot_cli.py \
+    --ref reference.h5ad \
+    --spatial spatial_multi_slide.h5ad \
+    --sample-key slide_id \
+    --save-combined \
+    -v
+```
+
+This produces per-sample results (`weights.csv`, `annotations.csv`, plots) and optionally a combined output with `--save-combined`.
+
+### Resolution modes
+
+```bash
+# High-resolution (Xenium, MERFISH, CosMx) — default
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad --mode highres
+
+# Low-resolution (Visium, ST)
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad --mode lowres --ratios-weight 0.3
+```
+
+### GPU acceleration and memory options
+
+```bash
+# Automatic GPU detection (default)
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad --device auto
+
+# Force CPU
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad --device cpu
+
+# Mixed precision for large datasets on GPU
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad --device cuda --mixed-precision
+```
+
+### Checkpointing for long runs
+
+```bash
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad \
+    --checkpoint-dir ./checkpoints --checkpoint-freq 10
+
+# Resume from a checkpoint
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad \
+    --resume-from ./checkpoints/sample_1/checkpoint_iter_50.pkl
+```
+
+### Lineage-level annotation
+
+When the reference contains a higher-level grouping (e.g., lineage or broad class), the CLI can map cell types to that level automatically:
+
+```bash
+python run_dot_cli.py --ref ref.h5ad --spatial spatial.h5ad \
+    --cell-type-key cell_type --lineage-key lineage
+```
+
+### Full example
+
+```bash
+python run_dot_cli.py \
+    --ref reference.h5ad \
+    --spatial visium_slides.h5ad \
+    --sample-key slide_id \
+    --cell-type-key cell_subclass \
+    --lineage-key cell_class \
+    --mode lowres \
+    --ratios-weight 0.3 \
+    --max-genes 5000 \
+    --subcluster-size 10 \
+    --batch-size 5000 \
+    --iterations 100 \
+    --device auto \
+    --output dot_results \
+    --output-dir ./results \
+    --save-combined \
+    -v
+```
+
+### All CLI options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ref` | *(required)* | Path to reference scRNA-seq h5ad file |
+| `--spatial` | *(required)* | Path to spatial transcriptomics h5ad file |
+| `--sample-key` | `None` | Column in `obs` to split spatial data by sample/slide |
+| `--cell-type-key` | `cell_type` | Column in reference `obs` with cell type labels |
+| `--lineage-key` | `None` | Column in reference `obs` for higher-level grouping |
+| `--counts-layer` | `counts` | Layer with raw counts (`"X"` to use `.X` directly) |
+| `--mode` | `highres` | `highres` or `lowres` |
+| `--ratios-weight` | `0.0` | Weight for matching reference cell-type abundances |
+| `--max-genes` | `5000` | Maximum genes for reference preprocessing |
+| `--subcluster-size` | `10` | Maximum subclusters per cell type |
+| `--th-spatial` | `0.84` | Cosine similarity threshold for spatial pairs |
+| `--batch-size` | `5000` | Batch size for GPU processing |
+| `--iterations` | `100` | Maximum Frank-Wolfe iterations |
+| `--device` | `auto` | `auto`, `cuda`, or `cpu` |
+| `--mixed-precision` | off | Use float16 intermediates on GPU |
+| `--checkpoint-dir` | `None` | Directory for checkpoints |
+| `--checkpoint-freq` | `10` | Checkpoint every N iterations |
+| `--resume-from` | `None` | Resume from a checkpoint file |
+| `--output` | `dot_results` | Output file prefix |
+| `--output-dir` | `.` | Output directory |
+| `--save-combined` | off | Merge per-sample results into one file |
+| `--no-plots` | off | Skip plot generation |
+| `--no-h5ad` | off | Skip saving per-sample h5ad files |
+| `-v`, `--verbose` | off | Print detailed progress |
+
+### Output files
+
+For each sample, the CLI produces:
+
+```
+results/
+  dot_results_slide1_weights.csv         # Cell-type weights per spot (S x K)
+  dot_results_slide1_annotations.csv     # Dominant cell type per spot
+  dot_results_slide1.h5ad                # Full AnnData with results
+  figures/
+    dot_results_slide1_cell_types.png    # Spatial cell type map
+    dot_results_slide1_weights.png       # Per-type weight heatmaps
+    dot_results_slide1_convergence.png   # Optimization convergence plot
+  dot_results_combined_weights.csv       # (with --save-combined)
+  dot_results_combined.h5ad              # (with --save-combined)
+```
 
 ### High-Resolution Data (Xenium, MERFISH, CosMx)
 
