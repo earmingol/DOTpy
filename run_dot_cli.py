@@ -52,6 +52,8 @@ def parse_args():
                         help='Column in ref_adata.obs with lineage annotations (optional)')
     parser.add_argument('--counts-layer', default='counts',
                         help='Layer in spatial_adata with raw counts (or "X" to use .X)')
+    parser.add_argument('--ref-counts-layer', default='X',
+                        help='Layer in ref_adata with raw counts (or "X" to use .X)')
 
     # Output
     parser.add_argument('--output', '-o', default='dot_results',
@@ -155,14 +157,23 @@ def main():
     print(f"  Reference: {ref_adata.shape}")
     print(f"  Spatial: {spatial_adata.shape}")
 
-    # Set counts to .X if needed
+    # Set reference counts to .X if needed
+    if args.ref_counts_layer != 'X':
+        if args.ref_counts_layer in ref_adata.layers:
+            if args.verbose:
+                print(f"  Using reference counts from layer: {args.ref_counts_layer}")
+            ref_adata.X = ref_adata.layers[args.ref_counts_layer].copy()
+        else:
+            print(f"  Warning: Layer '{args.ref_counts_layer}' not found in reference, using .X")
+
+    # Set spatial counts to .X if needed
     if args.counts_layer != 'X':
         if args.counts_layer in spatial_adata.layers:
             if args.verbose:
-                print(f"  Using counts from layer: {args.counts_layer}")
+                print(f"  Using spatial counts from layer: {args.counts_layer}")
             spatial_adata.X = spatial_adata.layers[args.counts_layer].copy()
         else:
-            print(f"  Warning: Layer '{args.counts_layer}' not found, using .X")
+            print(f"  Warning: Layer '{args.counts_layer}' not found in spatial, using .X")
 
     # -------------------------------------------------------------------------
     # 2. Process reference

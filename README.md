@@ -202,7 +202,8 @@ python run_dot_cli.py \
 | `--sample-key` | `None` | Column in `obs` to split spatial data by sample/slide |
 | `--cell-type-key` | `cell_type` | Column in reference `obs` with cell type labels |
 | `--lineage-key` | `None` | Column in reference `obs` for higher-level grouping |
-| `--counts-layer` | `counts` | Layer with raw counts (`"X"` to use `.X` directly) |
+| `--counts-layer` | `counts` | Layer in spatial data with raw counts (`"X"` to use `.X` directly) |
+| `--ref-counts-layer` | `X` | Layer in reference data with raw counts (`"X"` to use `.X` directly) |
 | `--mode` | `highres` | `highres` or `lowres` |
 | `--ratios-weight` | `0.0` | Weight for matching reference cell-type abundances |
 | `--max-genes` | `5000` | Maximum genes for reference preprocessing |
